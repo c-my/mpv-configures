@@ -1,60 +1,76 @@
--- This script saves the sub-delay quantity for each file.
--- When next time the file is opened, sub-delay is automatically restored.
--- Using `--sub-delay=<sec>` or `x` and `z` key-bindings both work.
--- But keep in mind that this script distinguishes different files by reading
--- their 'path' properties. If you use in command line:
---     `mpv --sub-delay=0.1 example.mkv`
--- this delay value won't be applied to the same file you open by
--- double-clicking it.
+-- 自动记住每个文件的 sub-delay（字幕延时），下次打开同一个文件时自动恢复。
+--
+-- 数据保存在 ~~/mpv-sub-delay.json，~~ 跟随 --config-dir。
+-- 脚本不绑定按键，只监听 sub-delay 的变化并落盘，键位仍由 input.conf 决定。
 
-local mputils = require "mp.utils"
+local utils = require 'mp.utils'
+local msg = require 'mp.msg'
 
-local JSON = (os.getenv('APPDATA') or os.getenv('HOME')..'/.config')..'/mpv/mpv_sub-delay.json'
-local jsonFile = io.open(JSON, 'a+')
-local sub_delay_table = mputils.parse_json(jsonFile:read("*all"))
-jsonFile:close()
+-- ~~ = 当前 mpv 配置目录（受 --config-dir 影响）
+local DATA_FILE = mp.command_native({'expand-path', '~~/mpv-sub-delay.json'})
 
-function read_sub_delay()
-    local sub_delay = mp.get_property_native("sub-delay")
-    local path = mp.get_property_native("path")
-    if sub_delay_table == nil then
-        sub_delay_table = {}
-    end
-    if sub_delay == 0 then
-        if sub_delay_table[path] ~= nil then
-            sub_delay = sub_delay_table[path]
-            if sub_delay > 0.000999 or sub_delay < -0.000999 then
-                mp.command("add sub-delay " .. sub_delay)
-            end
-        end
+local delays = {}
+local current_path = nil
+local restoring = false
+local last_value = nil
+
+local function load_data()
+    local f = io.open(DATA_FILE, 'r')
+    if not f then return end
+    local content = f:read('*a')
+    f:close()
+    if not content or content == '' then return end
+    local parsed = utils.parse_json(content)
+    if type(parsed) == 'table' then
+        delays = parsed
     else
-        sub_delay_table[path] = sub_delay
-        write_sub_delay()
+        msg.warn('解析失败，忽略 ' .. DATA_FILE)
     end
 end
 
-function write_sub_delay()
-    local jsonFile = io.open(JSON, 'w+')
-    local path = mp.get_property_native("path")
-    sub_delay_table[path] = mp.get_property_native("sub-delay")
-    local jsonContent, ret = mputils.format_json(sub_delay_table)
-    if ret ~= error and jsonContent ~= nil then
-        jsonFile:write(jsonContent)
+local function save_data()
+    local json = utils.format_json(delays)
+    if not json then return end
+    local f = io.open(DATA_FILE, 'w')
+    if not f then
+        msg.warn('无法写入 ' .. DATA_FILE)
+        return
     end
-    jsonFile:close()
+    f:write(json)
+    f:close()
 end
 
-function sub_delay_pos()
-    mp.command("add sub-delay 0.1")
-    write_sub_delay()
-end
+-- 换文件时，mpv 会把 sub-delay 重置，这期间的变化不记录，
+-- 否则会先把上次存的值覆盖成 0。
+mp.register_event('start-file', function()
+    restoring = true
+    current_path = mp.get_property('path')
+end)
 
-function sub_delay_neg()
-    mp.command("add sub-delay -0.1")
-    write_sub_delay()
-end
+mp.register_event('file-loaded', function()
+    current_path = mp.get_property('path')
+    local saved = current_path and delays[current_path]
+    if saved and math.abs(saved) > 0.000999 then
+        mp.set_property_native('sub-delay', saved)
+        msg.verbose(('恢复 sub-delay=%.2f'):format(saved))
+    end
+    -- 换文件时 mpv 会把 sub-delay 重置成 0，那次变化发生在 file-loaded 之前，
+    -- 已经靠 restoring 挡掉了；到这里就恢复监听。
+    restoring = false
+end)
 
-mp.register_event("file-loaded", read_sub_delay)
+mp.observe_property('sub-delay', 'number', function(_, value)
+    if restoring or not current_path or not value then return end
+    last_value = value
+    delays[current_path] = value
+    save_data()
+end)
 
-mp.add_key_binding("x", "sub-delay+", sub_delay_pos)
-mp.add_key_binding("z", "sub-delay-", sub_delay_neg)
+mp.register_event('shutdown', function()
+    if current_path and last_value and not restoring then
+        delays[current_path] = last_value
+        save_data()
+    end
+end)
+
+load_data()
